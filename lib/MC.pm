@@ -12,6 +12,8 @@ sub new {
   my $type = shift;
   my $self = {};
   @{$self}{qw/address port/} = @_;
+  $self->{address} //= 'localhost';
+  $self->{port} //= MEMCACHED_PORT;
   $self->{ioloop} = Mojo::IOLoop->new;
   bless $self, $type;
   return $self;
@@ -22,7 +24,7 @@ sub set {
   my $cb = ref $_[-1] eq 'CODE' ? pop : undef;
   my ($key, $flags, $value, $opt) = @_;
   $opt->{exptime} //= 0;
-  $opt->{noreply} //= 0;
+  $opt->{noreply} //= '';
 
   my $data = join ' ', 'set', $key, $flags, $opt->{exptime}, length $value;
   $data .= ' noreply' if $opt->{noreply};
@@ -48,9 +50,9 @@ sub delete {
   my $self = shift;
   my $cb = ref $_[-1] eq 'CODE' ? pop : undef;
   my ($key, $opt) = @_;
-  $opt->{noreply} //= 0;
+  $opt->{noreply} //= '';
 
-  my $data = "delete ${key}";
+  my $data = "delete ${key}\r\n";
   $data .= ' noreply' if $opt->{noreply};
   my $req = {data => $data, name => 'delete'};
   $self->_request($req, $cb);
@@ -61,7 +63,7 @@ sub _request {
   if ($cb) {
     $self->_clean unless $self->{async};
     $self->{async} = 1;
-    $req->{cb} = $cb;
+    $req->{cb}     = $cb;
     push @{$self->{queue}}, $req;
     $self->{connection} ? $self->_write : $self->_connect;
     return;
@@ -84,6 +86,10 @@ sub _request {
   return $response;
 }
 
+sub DESTROY {
+  shift->_clean;
+}
+
 sub _clean {
   my $self = shift;
   my $loop = $self->{async} ? Mojo::IOLoop->singleton : $self->{ioloop};
@@ -98,11 +104,11 @@ sub _connect {
   my $self = shift;
   my $loop = $self->{async} ? Mojo::IOLoop->singleton : $self->{ioloop};
   $self->{connection} = $loop->client(
-    {address => $self->{address}, port => $self->{port} // MEMCACHED_PORT} => sub {
+    {address => $self->{address}, port => $self->{port}} => sub {
       my ($loop, $err, $stream) = @_;
       if ($err) {
         warn "Error while connect: $err" if DEBUG;
-        return $self->_response("$err");
+        return $self->_response($err);
       }
       warn "Connected to $self->{address}" if DEBUG;
       $stream->on(
@@ -110,7 +116,12 @@ sub _connect {
           my ($stream, $bytes) = @_;
           $self->_read($bytes);
         });
-      $stream->on(error => sub { warn "ERORR!" });
+      $stream->on(
+        error => sub {
+          my ($client, $err) = @_;
+          warn "Error in connection: $err" if DEBUG;
+          return $self->_response($err);
+        });
       $stream->on(
         close => sub {
           if (my $connection = delete $self->{connection}) {
@@ -131,23 +142,26 @@ sub _response {
 
 sub _read {
   my ($self, $bytes, $cb) = @_;
-  warn "Read response chunk: $bytes" if DEBUG;
+  warn "Read response chunk: '$bytes'" if DEBUG;
   $self->{buffer} .= $bytes;
-  my $response = $self->_parse($self->{queue}->[0]->{name}, \$self->{buffer});
-  $self->_response(undef, $response);
+  if ($self->{buffer} =~ /\r\n$/) {
+    my ($err, $response) = $self->_parse($self->{queue}->[0]->{name}, \$self->{buffer});
+    $self->_response($err, $response);
+  }
 }
 
 sub _parse {
   my ($self, $type, $buffer) = @_;
-  my $response;
+  my ($err, $response);
+  $$buffer =~ s/^(ERROR\r\n)+//;
   given ($type) {
     when ('set') {
       $$buffer =~ m/
         ^
         (?'RESPONSE'
             ERROR                        # General error
-          | CLIENT_ERROR \w+             # Input error
-          | SERVER_ERROR \w+             # Server error
+          | CLIENT_ERROR\s[\w\s]+        # Input error
+          | SERVER_ERROR\s[\w\s]+        # Server error
           | STORED                       # Set OK
           | NOT_STORED                   # Add or Replace fail
           | EXISTS
@@ -155,8 +169,13 @@ sub _parse {
         )
         \r\n
       /xm;
-      $$buffer  = $';
-      $response = $+{RESPONSE};
+      $$buffer = $';
+      if ($+{RESPONSE} eq 'STORED') {
+        $response = 1;
+      } else {
+        $response = undef;
+        $err      = "Protocol error: $+{RESPONSE}";
+      }
     }
     when ('delete') {
       $$buffer =~ m/
@@ -192,21 +211,21 @@ sub _parse {
       if (1 == @keys) {
         $response =
           {value => $response->{$keys[0]}->{value}, flags => $response->{$keys[0]}->{flags}};
+      } elsif (0 == @keys) {
+        $response = undef;
       }
     }
   }
-  return $response;
+  return ($err, $response);
 }
 
 sub _write {
   my $self   = shift;
   my $loop   = $self->{async} ? Mojo::IOLoop->singleton : $self->{ioloop};
   my $stream = $loop->stream($self->{connection});
-  unless ($stream) {
-    warn "NO STREAM";
-    return;
-  }
+  return unless $stream;
   my $req = $self->{queue}->[0];
+  warn "Write request chunk: '$req->{data}'" if DEBUG;
   $stream->write($req->{data});
 }
 
