@@ -230,3 +230,86 @@ sub _write {
 }
 
 1;
+
+__END__
+
+=head1 NAME
+
+MC - Async Memcached client using C<Mojo::IOLoop> for event loop
+
+=head1 SYNOPSIS
+
+  use MC;
+
+  # Blocking API
+
+  my $mc = MC->new('localhost', 11211);
+  my $flags = 13;
+  $mc->set('key', $flags, 'value');
+  my $value = $mc->get('key')->{value}; # value
+  $mc->delete('key');
+  $value = $mc->get('key'); # undef
+  $mc->set('key1', 0, 'value1');
+  $mc->set('key2', 0, 'value2');
+  my $values = $mc->get([qw/key1 key2/]);
+  print $values->{key1}{value}; # value1
+  print $values->{key2}{flags}; # 0
+
+  # Non-blocking API
+
+  use Mojo::IOLoop;
+  $mc->set(('akey', 1, 'avalue') => sub {
+    my ($mc, $err, $response) = @_;
+    die "Error: $err" if $err;
+    $mc->get(akey => sub {
+      my ($mc, $err, $response) = @_;
+        die "Error: $err" if $err;
+        print $response->{value}; # avalue
+        Mojo::IOLoop->stop;
+    });
+  });
+
+  Mojo::IOLoop->start;
+
+=head1 METHODS
+
+=head2 set
+
+  $mc->set($key, $flags, $value);
+  $mc->set($key, $flags, $value, {exptime => 10});
+
+Store $value and $flags associated with $key in Memcached.
+
+  $mc->set($key, $flags, $value, sub {
+    my ($mc, $err, $response) = @_;
+    ...
+  });
+
+You can append callback to C<set> for perform methond non-blocking.
+
+=head2 get
+
+  $mc->get($key); # {value => '...', flags => '...'}
+  $mc->get([$key1, $key2, $key3]); # {$key1 => {...}, $key2 => {...}}
+
+Get one or more flags and values from Memcached by key(s).
+
+  $mc->get([$key1, $key2] => sub {
+    my ($mc, $err, $response) = @_;
+    ...
+  });
+
+You can append callback to C<get> for perform methond non-blocking.
+
+=head2 delete
+
+  $mc->delete($key);
+
+Delete flags and value associated with $key from Memcached.
+
+  $mc->delete($key => sub {
+    my ($mc, $err, $response) = @_;
+    ...
+  });
+
+You can append callback to C<delete> for perform methond non-blocking.
